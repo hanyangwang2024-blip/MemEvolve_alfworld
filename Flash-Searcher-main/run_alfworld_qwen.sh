@@ -2,13 +2,15 @@
 # ============================================================================
 # Run Alfworld tasks with Qwen2.5-7B-Instruct model on GPU 0 and 1
 # 
-# This script:
-# 1. Starts a vLLM server with Qwen2.5-7B-Instruct on GPU 0,1
-# 2. Runs Alfworld evaluation tasks
-# 3. Cleans up the server on exit
+# This script uses FastChat (official method) to serve the model:
+# 1. Starts FastChat controller
+# 2. Starts FastChat model worker with Qwen2.5-7B-Instruct on GPU 0,1
+# 3. Starts FastChat OpenAI API server
+# 4. Runs Alfworld evaluation tasks
+# 5. Cleans up all services on exit
 #
 # Requirements:
-# - vLLM installed: pip install vllm
+# - FastChat installed (from ETO/fastchat or install: pip install fschat)
 # - CUDA-capable GPUs (0 and 1)
 # - Alfworld data downloaded
 # ============================================================================
@@ -17,7 +19,7 @@ set -e  # Exit on error
 
 # ==================== Configuration ====================
 # GPU configuration
-CUDA_VISIBLE_DEVICES="0,1"
+CUDA_VISIBLE_DEVICES="1,3"
 NUM_GPUS=2
 
 # Model configuration
@@ -25,11 +27,14 @@ MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
 # If you have the model locally, you can set:
 # MODEL_NAME="/path/to/local/Qwen2.5-7B-Instruct"
 
-# vLLM server configuration
-VLLM_HOST="localhost"
-VLLM_PORT=8000
-VLLM_API_KEY="EMPTY"  # vLLM doesn't require API key by default
-VLLM_MAX_MODEL_LEN=8192  # Maximum sequence length
+# FastChat server configuration
+CONTROLLER_HOST="localhost"
+CONTROLLER_PORT=21001
+WORKER_HOST="localhost"
+WORKER_PORT=21002
+API_SERVER_HOST="localhost"
+API_SERVER_PORT=8000
+API_KEY="EMPTY"  # FastChat doesn't require API key by default
 
 # Alfworld task configuration
 ALFWORLD_SPLIT="test"  # Options: train, dev, test
@@ -45,6 +50,20 @@ OUTPUT_FILE="${OUTPUT_DIR}/qwen_results.jsonl"
 # Log directory
 LOG_DIR="./logs"
 mkdir -p ${LOG_DIR}
+
+# FastChat path (adjust if needed)
+# If FastChat is in ETO directory
+if [ -d "../ETO/fastchat" ]; then
+    FASTCHAT_PATH="../ETO/fastchat"
+    PYTHON_CMD="python -u -m fastchat.serve"
+elif [ -d "../../ETO/fastchat" ]; then
+    FASTCHAT_PATH="../../ETO/fastchat"
+    PYTHON_CMD="python -u -m fastchat.serve"
+else
+    # Assume FastChat is installed as package
+    FASTCHAT_PATH=""
+    PYTHON_CMD="python -u -m fastchat.serve"
+fi
 
 # ==================== Functions ====================
 
@@ -63,16 +82,19 @@ check_port() {
     return 1  # Port is free
 }
 
-# Function to wait for server to be ready
-wait_for_server() {
+# Function to wait for service to be ready
+wait_for_service() {
+    local url=$1
+    local service_name=$2
     local max_attempts=120  # 4 minutes max wait time
     local attempt=0
-    echo "Waiting for vLLM server to be ready (this may take a few minutes for model loading)..."
+    
+    echo "Waiting for ${service_name} to be ready..."
     
     while [ $attempt -lt $max_attempts ]; do
-        if curl -s http://${VLLM_HOST}:${VLLM_PORT}/health > /dev/null 2>&1; then
+        if curl -s ${url} > /dev/null 2>&1; then
             echo ""
-            echo "✓ vLLM server is ready!"
+            echo "✓ ${service_name} is ready!"
             return 0
         fi
         attempt=$((attempt + 1))
@@ -85,8 +107,7 @@ wait_for_server() {
     done
     
     echo ""
-    echo "ERROR: vLLM server failed to start within $((max_attempts * 2)) seconds"
-    echo "Check logs: ${LOG_DIR}/vllm_server.log"
+    echo "ERROR: ${service_name} failed to start within $((max_attempts * 2)) seconds"
     return 1
 }
 
@@ -94,17 +115,35 @@ wait_for_server() {
 cleanup() {
     echo ""
     echo "=========================================="
-    echo "Cleaning up..."
-    if [ ! -z "${VLLM_PID}" ]; then
-        echo "Stopping vLLM server (PID: ${VLLM_PID})..."
-        kill ${VLLM_PID} 2>/dev/null || true
-        # Wait a bit for graceful shutdown
-        sleep 3
-        # Force kill if still running
-        kill -9 ${VLLM_PID} 2>/dev/null || true
-        wait ${VLLM_PID} 2>/dev/null || true
-        echo "vLLM server stopped."
+    echo "Cleaning up FastChat services..."
+    
+    # Kill API server
+    if [ ! -z "${API_SERVER_PID}" ]; then
+        echo "Stopping OpenAI API server (PID: ${API_SERVER_PID})..."
+        kill ${API_SERVER_PID} 2>/dev/null || true
+        sleep 2
+        kill -9 ${API_SERVER_PID} 2>/dev/null || true
+        wait ${API_SERVER_PID} 2>/dev/null || true
     fi
+    
+    # Kill model worker
+    if [ ! -z "${WORKER_PID}" ]; then
+        echo "Stopping model worker (PID: ${WORKER_PID})..."
+        kill ${WORKER_PID} 2>/dev/null || true
+        sleep 2
+        kill -9 ${WORKER_PID} 2>/dev/null || true
+        wait ${WORKER_PID} 2>/dev/null || true
+    fi
+    
+    # Kill controller
+    if [ ! -z "${CONTROLLER_PID}" ]; then
+        echo "Stopping controller (PID: ${CONTROLLER_PID})..."
+        kill ${CONTROLLER_PID} 2>/dev/null || true
+        sleep 2
+        kill -9 ${CONTROLLER_PID} 2>/dev/null || true
+        wait ${CONTROLLER_PID} 2>/dev/null || true
+    fi
+    
     echo "Cleanup complete."
     echo "=========================================="
 }
@@ -116,6 +155,7 @@ trap cleanup EXIT INT TERM
 
 echo "=========================================="
 echo "Alfworld Evaluation with Qwen2.5-7B-Instruct"
+echo "Using FastChat (Official Method)"
 echo "=========================================="
 echo "Model: ${MODEL_NAME}"
 echo "GPUs: ${CUDA_VISIBLE_DEVICES} (${NUM_GPUS} GPUs)"
@@ -135,35 +175,33 @@ fi
 echo "=========================================="
 echo ""
 
-# Check if vLLM is installed
-if ! command -v vllm &> /dev/null; then
-    echo "ERROR: vLLM is not installed."
+# Check if FastChat is available
+if ! python -c "import fastchat" 2>/dev/null; then
+    echo "ERROR: FastChat is not installed or not in Python path."
     echo ""
-    echo "Please install it with:"
-    echo "  pip install vllm"
+    echo "Please ensure FastChat is available:"
+    echo "  1. If using ETO/fastchat, make sure it's in PYTHONPATH"
+    echo "  2. Or install: pip install fschat"
     echo ""
-    echo "Or with specific CUDA version:"
-    echo "  pip install vllm --extra-index-url https://download.pytorch.org/whl/cu121"
+    echo "To use ETO's FastChat, you can:"
+    echo "  export PYTHONPATH=\$PYTHONPATH:/path/to/ETO"
     exit 1
 fi
 
 # Check if curl is available (for health check)
 if ! command -v curl &> /dev/null; then
     echo "WARNING: curl is not installed. Health check will be skipped."
-    echo "Please install curl or modify the script to use another method."
 fi
 
-# Check if port is available
-if check_port ${VLLM_PORT}; then
-    echo "WARNING: Port ${VLLM_PORT} is already in use."
-    echo "Please stop the service using this port or change VLLM_PORT in the script."
-    echo ""
-    echo "To find what's using the port:"
-    echo "  lsof -i :${VLLM_PORT}"
-    echo "  or"
-    echo "  netstat -tuln | grep ${VLLM_PORT}"
-    exit 1
-fi
+# Check if ports are available
+PORTS_TO_CHECK=("${CONTROLLER_PORT}" "${WORKER_PORT}" "${API_SERVER_PORT}")
+for port in "${PORTS_TO_CHECK[@]}"; do
+    if check_port ${port}; then
+        echo "WARNING: Port ${port} is already in use."
+        echo "Please stop the service using this port or change the port in the script."
+        exit 1
+    fi
+done
 
 # Check CUDA availability
 if ! python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'; print(f'CUDA available: {torch.cuda.device_count()} GPUs')" 2>/dev/null; then
@@ -174,49 +212,88 @@ fi
 # Set CUDA devices
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 
-# Start vLLM server
+# Start FastChat services
 echo "=========================================="
-echo "Starting vLLM server..."
+echo "Starting FastChat Services"
 echo "=========================================="
 echo "Model: ${MODEL_NAME}"
-echo "Host: ${VLLM_HOST}"
-echo "Port: ${VLLM_PORT}"
 echo "GPUs: ${CUDA_VISIBLE_DEVICES}"
-echo "Tensor Parallel Size: ${NUM_GPUS}"
-echo "Max Model Length: ${VLLM_MAX_MODEL_LEN}"
-echo "Logs: ${LOG_DIR}/vllm_server.log"
+echo "Controller: ${CONTROLLER_HOST}:${CONTROLLER_PORT}"
+echo "Worker: ${WORKER_HOST}:${WORKER_PORT}"
+echo "API Server: ${API_SERVER_HOST}:${API_SERVER_PORT}"
+echo "=========================================="
 echo ""
 
-# Start vLLM server in background
-# Note: --trust-remote-code is needed for Qwen models
-vllm serve ${MODEL_NAME} \
-    --host ${VLLM_HOST} \
-    --port ${VLLM_PORT} \
-    --tensor-parallel-size ${NUM_GPUS} \
+# 1. Start Controller
+echo "Starting FastChat controller..."
+${PYTHON_CMD}.controller \
+    --host ${CONTROLLER_HOST} \
+    --port ${CONTROLLER_PORT} \
+    > ${LOG_DIR}/fastchat_controller.log 2>&1 &
+
+CONTROLLER_PID=$!
+echo "Controller started with PID: ${CONTROLLER_PID}"
+sleep 5
+
+# 2. Start Model Worker
+echo "Starting FastChat model worker..."
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} ${PYTHON_CMD}.model_worker \
+    --model-path ${MODEL_NAME} \
+    --controller-address http://${CONTROLLER_HOST}:${CONTROLLER_PORT} \
+    --worker-address http://${WORKER_HOST}:${WORKER_PORT} \
+    --host ${WORKER_HOST} \
+    --port ${WORKER_PORT} \
+    --num-gpus ${NUM_GPUS} \
     --trust-remote-code \
-    --max-model-len ${VLLM_MAX_MODEL_LEN} \
-    --gpu-memory-utilization 0.9 \
-    > ${LOG_DIR}/vllm_server.log 2>&1 &
+    > ${LOG_DIR}/fastchat_worker.log 2>&1 &
 
-VLLM_PID=$!
-echo "vLLM server started with PID: ${VLLM_PID}"
-echo ""
+WORKER_PID=$!
+echo "Model worker started with PID: ${WORKER_PID}"
+echo "Waiting for model to load (this may take several minutes)..."
+sleep 30
 
-# Wait for server to be ready
-if ! wait_for_server; then
+# Wait for worker to be ready (check if it registered with controller)
+echo "Checking worker status..."
+for i in {1..60}; do
+    if curl -s http://${CONTROLLER_HOST}:${CONTROLLER_PORT}/list_models > /dev/null 2>&1; then
+        MODELS=$(curl -s http://${CONTROLLER_HOST}:${CONTROLLER_PORT}/list_models)
+        if echo "${MODELS}" | grep -q "${MODEL_NAME}" || echo "${MODELS}" | grep -q "model"; then
+            echo "✓ Model worker is ready!"
+            break
+        fi
+    fi
+    if [ $i -eq 60 ]; then
+        echo "WARNING: Worker may not be fully ready, but continuing..."
+    fi
+    sleep 2
+done
+
+# 3. Start OpenAI API Server
+echo "Starting FastChat OpenAI API server..."
+${PYTHON_CMD}.openai_api_server \
+    --controller-address http://${CONTROLLER_HOST}:${CONTROLLER_PORT} \
+    --host ${API_SERVER_HOST} \
+    --port ${API_SERVER_PORT} \
+    > ${LOG_DIR}/fastchat_api_server.log 2>&1 &
+
+API_SERVER_PID=$!
+echo "OpenAI API server started with PID: ${API_SERVER_PID}"
+
+# Wait for API server to be ready
+if ! wait_for_service "http://${API_SERVER_HOST}:${API_SERVER_PORT}/health" "OpenAI API server"; then
     echo ""
-    echo "Failed to start vLLM server."
-    echo "Last 50 lines of server log:"
+    echo "Failed to start OpenAI API server."
+    echo "Last 50 lines of API server log:"
     echo "----------------------------------------"
-    tail -50 ${LOG_DIR}/vllm_server.log
+    tail -50 ${LOG_DIR}/fastchat_api_server.log
     echo "----------------------------------------"
     exit 1
 fi
 
 # Set environment variables for the evaluation script
 export DEFAULT_MODEL="Qwen/Qwen2.5-7B-Instruct"
-export OPENAI_API_BASE="http://${VLLM_HOST}:${VLLM_PORT}/v1"
-export OPENAI_API_KEY="${VLLM_API_KEY}"
+export OPENAI_API_BASE="http://${API_SERVER_HOST}:${API_SERVER_PORT}/v1"
+export OPENAI_API_KEY="${API_KEY}"
 
 echo ""
 echo "=========================================="
@@ -283,7 +360,9 @@ else
     echo ""
     echo "Check logs:"
     echo "  - Evaluation log: ${LOG_DIR}/alfworld_eval.log"
-    echo "  - Server log: ${LOG_DIR}/vllm_server.log"
+    echo "  - Controller log: ${LOG_DIR}/fastchat_controller.log"
+    echo "  - Worker log: ${LOG_DIR}/fastchat_worker.log"
+    echo "  - API server log: ${LOG_DIR}/fastchat_api_server.log"
 fi
 echo "=========================================="
 
