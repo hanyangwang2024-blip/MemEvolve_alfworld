@@ -29,6 +29,7 @@ class AlfworldEnvWrapper:
         self.current_task_idx = -1
         self.current_observation = ""
         self.current_game_file = ""
+        self.current_admissible_actions = []
         self.done = False
         self.reward = 0
         self.steps = 0
@@ -43,23 +44,24 @@ class AlfworldEnvWrapper:
         try:
             import alfworld
             import alfworld.agents.environment as envs
+            from alfworld.agents.environment import get_environment
         except ImportError:
             raise ImportError(
                 "alfworld is not installed. Please install it with: "
                 "pip install alfworld"
             )
-        
-        # Set environment data path
-        alfworld_data_path = os.path.dirname(self.config_path)
-        os.environ["ALFWORLD_DATA"] = alfworld_data_path
-        
+
+        # Set environment data path (only if not already set)
+        if "ALFWORLD_DATA" not in os.environ:
+            alfworld_data_path = os.path.dirname(self.config_path)
+            os.environ["ALFWORLD_DATA"] = alfworld_data_path
+
         with open(self.config_path) as f:
             config = yaml.safe_load(f)
-        
+
         env_type = config.get("env", {}).get("type", "AlfredTWEnv")
-        self.env = getattr(alfworld.agents.environment, env_type)(
-            config, train_eval=self.split
-        )
+        AlfredEnvClass = get_environment(env_type)
+        self.env = AlfredEnvClass(config, train_eval=self.split)
         self.env = self.env.init_env(batch_size=1)
         self._initialized = True
         logger.info(f"Alfworld environment initialized with split: {self.split}")
@@ -95,9 +97,17 @@ class AlfworldEnvWrapper:
                     )
         
         obs, info = self.env.reset()
-        
-        # Process observation - remove initial description part
-        obs_text = obs[0] if isinstance(obs, list) else obs
+
+        # Process observation - handle different return formats
+        if isinstance(obs, list):
+            obs_text = obs[0]
+        elif isinstance(obs, tuple):
+            obs_text = obs[0]
+        else:
+            obs_text = obs
+        # Handle nested structures
+        while isinstance(obs_text, (list, tuple)):
+            obs_text = obs_text[0]
         obs_lines = obs_text.split("\n\n")
         if len(obs_lines) > 1:
             obs_text = "\n".join(obs_lines[1:])
@@ -108,10 +118,19 @@ class AlfworldEnvWrapper:
         self.done = False
         self.reward = 0
         self.steps = 0
-        
+
+        # Extract admissible actions for initial state
+        admissible_actions = info.get('admissible_commands', [])
+        if isinstance(admissible_actions, list):
+            admissible_actions = admissible_actions[0] if len(admissible_actions) > 0 else []
+
+        # Store current admissible actions
+        self.current_admissible_actions = admissible_actions
+
         return self.current_observation, {
             "game_file": self.current_game_file,
-            "task_idx": self.current_task_idx
+            "task_idx": self.current_task_idx,
+            "admissible_actions": admissible_actions
         }
     
     def step(self, action: str) -> Tuple[str, float, bool, Dict[str, Any]]:
@@ -131,26 +150,76 @@ class AlfworldEnvWrapper:
             return "Task already completed.", self.reward, True, {"won": self.reward > 0}
         
         observation, reward, done, info = self.env.step([action])
-        
-        # Process outputs
-        obs_text = observation[0] if isinstance(observation, list) else observation
-        won = info.get('won', [False])[0]
-        done = done[0] if isinstance(done, list) else done
-        
+
+        # Process outputs - handle different return formats
+        # Official Alfworld returns batch format: [obs], reward, [done], info
+        if isinstance(observation, list):
+            obs_text = observation[0]
+        elif isinstance(observation, tuple):
+            obs_text = observation[0]
+        else:
+            obs_text = observation
+        # Handle nested structures
+        while isinstance(obs_text, (list, tuple)):
+            obs_text = obs_text[0]
+
+        # Extract reward signal - may be list or scalar
+        if isinstance(reward, (list, tuple)):
+            reward = reward[0] if len(reward) > 0 else 0
+        reward = float(reward) if reward is not None else 0.0
+
+        # Extract won signal - handle both list and scalar formats
+        # Official format: info['won'] = [True/False] (list for batch)
+        won_raw = info.get('won', [False])
+        if isinstance(won_raw, (list, tuple)):
+            won = won_raw[0] if len(won_raw) > 0 else False
+        else:
+            won = won_raw
+
+        # Extract done signal - handle both list and scalar formats
+        # Official format: done = [1.0/0.0] (list of floats for batch)
+        done = done[0] if isinstance(done, (list, tuple)) else done
+
+        # Convert to proper types
+        won = bool(won)
+        done = bool(done) or (float(done) > 0.5)  # Handle 0.0/1.0 format
+
+        # Detailed logging - CRITICAL: log all done/won signals
+        if done or won:
+            logger.info(f"⚠️  ALFWORLD SIGNAL: Step {self.steps}: action='{action}', done={done}, won={won}, reward={reward}")
+        else:
+            logger.debug(f"Step {self.steps}: action='{action}', done={done}, won={won}, reward={reward}, obs='{obs_text[:100]}...'")
+
         # Process observation text
-        if obs_text.startswith('You arrive at loc '):
+        if isinstance(obs_text, str) and obs_text.startswith('You arrive at loc '):
             obs_text = obs_text[obs_text.find('. ')+2:]
-        
+
         self.current_observation = obs_text
         self.done = done
-        self.reward = 1 if won else 0
+        self.reward = reward  # Use actual reward from environment, not derived
         self.steps += 1
-        
-        # Check max steps
-        if self.steps >= self.max_steps and not done:
+
+        # Extract admissible actions if available
+        admissible_actions = info.get('admissible_commands', [])
+        if isinstance(admissible_actions, list):
+            admissible_actions = admissible_actions[0] if len(admissible_actions) > 0 else []
+
+        # Store current admissible actions
+        self.current_admissible_actions = admissible_actions
+
+        # Check max steps - only mark done if we haven't already succeeded
+        max_steps_reached = self.steps >= self.max_steps and not done
+        if max_steps_reached:
             self.done = True
-            
-        return obs_text, self.reward, self.done, {"won": won, "steps": self.steps}
+            # Don't mark as won when max steps reached - keep won as Alfworld determined
+            done = True
+
+        return obs_text, self.reward, self.done, {
+            "won": won,
+            "steps": self.steps,
+            "max_steps_reached": max_steps_reached,
+            "admissible_actions": admissible_actions
+        }
 
 
 class AlfworldActionTool(Tool):
@@ -217,20 +286,39 @@ Returns the observation after executing the action."""
         
         try:
             observation, reward, done, info = self.env_wrapper.step(action)
-            
+
             self.task_completed = done
             self.task_success = info.get("won", False)
-            
+
             result = f"{observation}"
-            
+
+            # Check if task is done FIRST before showing actions
             if done:
+                # Make success/failure signal VERY prominent
+                result += "\n\n" + "="*60
                 if self.task_success:
-                    result += "\n\n[SUCCESS] Task completed successfully!"
+                    result += "\n[SUCCESS] Task completed successfully!"
+                    result += "\n[SUCCESS] You MUST now call the final_answer tool!"
+                    result += "\n[SUCCESS] Use: {\"name\": \"final_answer\", \"arguments\": {\"answer\": \"success\"}}"
                 else:
-                    result += "\n\n[FAILED] Task failed or max steps reached."
-            
+                    result += "\n[FAILED] Task failed or max steps reached."
+                    result += "\n[FAILED] You MUST now call the final_answer tool!"
+                    result += "\n[FAILED] Use: {\"name\": \"final_answer\", \"arguments\": {\"answer\": \"failed\"}}"
+                result += "\n" + "="*60
+                # Do NOT show available actions when task is done
+            else:
+                # Only show available actions if task is NOT done
+                admissible_actions = info.get("admissible_actions", [])
+                if admissible_actions and len(admissible_actions) > 0:
+                    result += "\n\n[AVAILABLE ACTIONS]"
+                    # Show up to 15 most relevant actions to keep context manageable
+                    for i, act in enumerate(admissible_actions[:15], 1):
+                        result += f"\n{i}. {act}"
+                    if len(admissible_actions) > 15:
+                        result += f"\n... and {len(admissible_actions) - 15} more actions available"
+
             return result
-            
+
         except Exception as e:
             logger.error(f"Error executing action '{action}': {e}")
             return f"Error: Invalid action '{action}'. Please use one of the available action formats."

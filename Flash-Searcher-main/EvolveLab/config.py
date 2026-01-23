@@ -47,9 +47,9 @@ DEFAULT_CONFIG = {
             "max_strategic_memories": 30,
             "max_operational_memories": 30,
             "max_shortterm_items": 15,
-            "shortterm_provision_interval": 5,
+            "shortterm_provision_interval": 5,  # Short-term memory every 5 steps
             "top_k_longterm": 3,
-            "enable_longterm_provision": False,
+            "enable_longterm_provision": False,  # Enable long-term memory retrieval
         },
         MemoryType.CEREBRA_FUSION_MEMORY: {
             "model": None,

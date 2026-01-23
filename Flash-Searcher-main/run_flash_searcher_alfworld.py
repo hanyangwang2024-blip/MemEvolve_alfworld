@@ -41,7 +41,7 @@ from datetime import datetime
 
 from FlashOAgents import OpenAIServerModel
 from FlashOAgents.alfworld_tool import AlfworldEnvWrapper
-from base_agent import AlfworldAgent
+from base_agent import AlfworldAgent, SimpleAlfworldAgent
 from utils import read_jsonl, write_jsonl
 from EvolveLab.memory_types import MemoryType, TrajectoryData, PROVIDER_MAPPING
 from EvolveLab.config import get_memory_config
@@ -168,15 +168,17 @@ def load_alfworld_tasks(config_path: str, split: str = "test",
     try:
         import alfworld
         import alfworld.agents.environment as envs
+        from alfworld.agents.environment import get_environment
     except ImportError:
         raise ImportError(
             "alfworld is not installed. Please install it with: "
             "pip install alfworld"
         )
     
-    # Set environment data path
-    alfworld_data_path = os.path.dirname(config_path)
-    os.environ["ALFWORLD_DATA"] = alfworld_data_path
+    # Set environment data path (only if not already set)
+    if "ALFWORLD_DATA" not in os.environ:
+        alfworld_data_path = os.path.dirname(config_path)
+        os.environ["ALFWORLD_DATA"] = alfworld_data_path
     
     with open(config_path) as f:
         config = yaml.safe_load(f)
@@ -195,9 +197,8 @@ def load_alfworld_tasks(config_path: str, split: str = "test",
         raise ValueError(f"Unknown split: {split}")
     
     env_type = config.get("env", {}).get("type", "AlfredTWEnv")
-    env = getattr(alfworld.agents.environment, env_type)(
-        config, train_eval=split_env
-    )
+    AlfredEnvClass = get_environment(env_type)
+    env = AlfredEnvClass(config, train_eval=split_env)
     env = env.init_env(batch_size=1)
     
     # Handle partitioning
@@ -212,7 +213,16 @@ def load_alfworld_tasks(config_path: str, split: str = "test",
     tasks = []
     for idx in range(n_tasks):
         obs, info = env.reset()
-        obs_text = obs[0] if isinstance(obs, list) else obs
+        # Handle different return formats from alfworld
+        if isinstance(obs, list):
+            obs_text = obs[0]
+        elif isinstance(obs, tuple):
+            obs_text = obs[0]
+        else:
+            obs_text = obs
+        # Handle nested structures
+        while isinstance(obs_text, (list, tuple)):
+            obs_text = obs_text[0]
         obs_lines = obs_text.split("\n\n")
         if len(obs_lines) > 1:
             obs_text = "\n".join(obs_lines[1:])
@@ -233,10 +243,10 @@ def load_alfworld_tasks(config_path: str, split: str = "test",
 
 def process_item(item, model_config, summary_interval, prompts_type, max_steps,
                  memory_type_str=None, env_config_path=None, split_env=None,
-                 enable_memory_evolution=True):
+                 enable_memory_evolution=True, use_simple_agent=False):
     """
     Process a single Alfworld task.
-    
+
     Args:
         item: Task dictionary with task_id, observation, game_file
         model_config: Model configuration dict
@@ -247,7 +257,8 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps,
         env_config_path: Path to Alfworld environment config
         split_env: Environment split name
         enable_memory_evolution: Whether to enable memory evolution
-        
+        use_simple_agent: Use simple text-based agent without tool calling
+
     Returns:
         Task result dictionary
     """
@@ -264,16 +275,26 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps,
     # Create environment wrapper for this task
     env_wrapper = AlfworldEnvWrapper(env_config_path, split=split_env)
     env_wrapper.max_steps = max_steps
-    
+
     # Create Alfworld agent
-    agent = AlfworldAgent(
-        task_model,
-        env_wrapper=env_wrapper,
-        summary_interval=summary_interval,
-        prompts_type=prompts_type,
-        max_steps=max_steps,
-        memory_provider=memory_provider
-    )
+    if use_simple_agent:
+        # Simple text-based agent without tool calling (better for smaller models)
+        agent = SimpleAlfworldAgent(
+            task_model,
+            env_wrapper=env_wrapper,
+            max_steps=max_steps,
+            memory_provider=memory_provider
+        )
+    else:
+        # Tool-calling based agent
+        agent = AlfworldAgent(
+            task_model,
+            env_wrapper=env_wrapper,
+            summary_interval=summary_interval,
+            prompts_type=prompts_type,
+            max_steps=max_steps,
+            memory_provider=memory_provider
+        )
     
     task_id = item.get("task_id")
     item_index = item.get("_global_index", task_id)
@@ -282,26 +303,19 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps,
     task_type = item.get("task_type", "unknown")
     
     try:
-        # If we have observation from file, use it directly
-        # Otherwise, reset environment to get the observation
+        # Always need to reset environment for actual execution
+        # The observation from file is just for display; we need the real environment
+        obs, info = agent.reset_task(task_id)
+
+        # Use file observation if available, otherwise use environment observation
         if observation:
-            # Using pre-loaded observation from file
             actual_observation = observation
-            # Still need to reset environment to the correct task for execution
-            # But we'll use the observation from file
-            try:
-                obs, info = agent.reset_task(task_id)
-                # Update game_file from environment if available
-                if info.get("game_file"):
-                    game_file = info.get("game_file")
-            except Exception as e:
-                logger.warning(f"Could not reset environment to task {task_id}: {e}. Using file observation.")
         else:
-            # No observation in file, must get from environment
-            obs, info = agent.reset_task(task_id)
-            actual_observation = obs if obs else observation
-            if info.get("game_file"):
-                game_file = info.get("game_file")
+            actual_observation = obs if obs else ""
+
+        # Update game_file from environment if available
+        if info.get("game_file"):
+            game_file = info.get("game_file")
         
         # Extract task description from observation
         # The first line usually contains the task goal
@@ -327,7 +341,10 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps,
         # Determine success
         is_correct = result.get("task_success", False)
         task_completed = result.get("task_completed", False)
-        
+
+        # Set status based on actual task success
+        status = "success" if is_correct else "failed"
+
         # Store in memory
         if memory_provider and enable_memory_evolution:
             try:
@@ -337,7 +354,7 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps,
                     result=result.get("agent_result"),
                     metadata={
                         "task_id": task_id,
-                        "status": "success",
+                        "status": status,
                         "is_correct": is_correct,
                         "task_type": task_type,
                         "game_file": game_file,
@@ -351,9 +368,9 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps,
                     logger.warning(f"Memory ingestion failed: {msg}")
             except Exception as e:
                 logger.warning(f"take_in_memory failed: {e}")
-        
+
         token_counter = TokenCounter.from_model(task_model)
-        
+
         task_result = {
             "agent_result": result.get("agent_result"),
             "is_correct": is_correct,
@@ -364,7 +381,7 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps,
             "question": task_description,
             "full_observation": actual_observation,
             "game_file": game_file,
-            "status": "success",
+            "status": status,
             "steps_taken": result.get("steps_taken", 0),
             "agent_trajectory": trajectory,
             "agent_messages": agent_messages,
@@ -431,7 +448,7 @@ def main(args):
     model_config = {
         "model_id": os.environ.get("DEFAULT_MODEL"),
         "custom_role_conversions": custom_role_conversions,
-        "max_completion_tokens": 32768,
+        "max_completion_tokens": 4096,  # Reduced for Qwen2.5-7B (32K context)
         "api_key": os.environ.get("OPENAI_API_KEY"),
         "api_base": os.environ.get("OPENAI_API_BASE"),
     }
@@ -552,7 +569,8 @@ def main(args):
                 args.memory_provider,
                 args.env_config_path,
                 split_env,
-                args.enable_memory_evolution
+                args.enable_memory_evolution,
+                args.simple_agent
             ) for item in data_to_run
         ]
         
@@ -701,7 +719,11 @@ if __name__ == '__main__':
     parser.add_argument('--env_config_path', type=str,
                         default="eval_agent/data/alfworld/base_config.yaml",
                         help='Path to Alfworld environment config')
-    
+
+    # Agent type
+    parser.add_argument('--simple_agent', action='store_true', default=False,
+                        help='Use simple text-based agent without tool calling (recommended for smaller models)')
+
     args = parser.parse_args()
     
     main(args)

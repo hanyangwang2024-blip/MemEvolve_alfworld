@@ -835,7 +835,8 @@ class ToolCallingAgent(MultiStepAgent):
             
             # Extract tool calls from response
             if isinstance(answer_data, list):
-                tool_calls_list = answer_data
+                # Filter to only include dict elements (valid tool calls)
+                tool_calls_list = [item for item in answer_data if isinstance(item, dict)]
             elif isinstance(answer_data, dict):
                 tool_calls_list = [answer_data]
             else:
